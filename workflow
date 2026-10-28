@@ -1,0 +1,47 @@
+# Save as .github/workflows/update-projections.yml in your repo
+name: Update NBA projections
+
+on:
+  schedule:
+    - cron: "0 11 * * *"   # daily at 11:00 UTC (early morning US time, after last night's games)
+  workflow_dispatch:        # lets you run it manually from the Actions tab
+
+permissions:
+  contents: write           # needed so the job can commit the new PNG
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: r-lib/actions/setup-r@v2
+        with:
+          use-public-rspm: true
+
+      - uses: r-lib/actions/setup-r-dependencies@v2
+        with:
+          packages: |
+            any::tidyverse
+            any::hoopR
+            any::gt
+            any::webshot2
+
+      # gtsave() to PNG renders the table in headless Chrome
+      - uses: browser-actions/setup-chrome@v1
+
+      - name: Run pipeline
+        run: Rscript nba_projection_pipeline.R
+
+      - name: Move PNG into the site folder
+        run: |
+          mkdir -p docs
+          mv nba_2027_projected_standings.png docs/
+
+      - name: Commit and push if changed
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add docs/nba_2027_projected_standings.png
+          git diff --cached --quiet || git commit -m "Update projections $(date -u +%F)"
+          git push
