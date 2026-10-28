@@ -3,7 +3,7 @@ name: Update NBA projections
 
 on:
   schedule:
-    - cron: "0 11 * * *"   # daily at 10:00 UTC (early morning US time, after last night's games)
+    - cron: "0 10 * * *"   # daily at 10:00 UTC (early morning US time, after last night's games)
   workflow_dispatch:        # lets you run it manually from the Actions tab
 
 permissions:
