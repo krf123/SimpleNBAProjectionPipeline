@@ -1,11 +1,8 @@
 # ══════════════════════════════════════════════════════════════════════════
 # NBA PROJECTION PIPELINE
-#   1. Load historical stats CSV (Win.Total already included)
-#   2. Reshape to long (season, team, game, metric)
-#   3. Interpolate 0..final_game; force game 0 to depend only on Win.Total
-#   4. Fit per-game coefficients for SRS and win% projections
-#   5. Load current-season data (hoopR) + saved win totals; project forward
-#   6. Build a standings table image
+#   1. Load saved per-game model coefficients (from nba_fit_models.R)
+#   2. Load current-season data (hoopR) + saved win totals; project forward
+#   3. Build a standings table image
 # ══════════════════════════════════════════════════════════════════════════
 
 library(tidyverse)
@@ -13,68 +10,14 @@ library(hoopR)
 library(gt)
 
 # ── Config ───────────────────────────────────────────────────────────────
-target_season        <- 2027
-hist_csv             <- "nba_srs_shooting_2007_2025.csv"
-lines_2027_csv       <- "Covers Win Totals NBA 2027.csv"
-min_obs_per_game_fit <- 30
-games_in_season      <- 82
+target_season   <- 2027
+coefs_csv       <- "projection_coefs_all_predictors.csv"
+lines_2027_csv  <- "Covers Win Totals NBA 2027.csv"
+games_in_season <- 82
 
 # ══════════════════════════════════════════════════════════════════════════
 # HELPERS
 # ══════════════════════════════════════════════════════════════════════════
-
-# Find the highest-numbered "<prefix>_<n>_games" column
-find_final <- function(prefix, d) {
-  cols <- names(d) %>% str_subset(paste0("^", prefix, "_\\d+_games$"))
-  if (length(cols) == 0) return(NA_character_)
-  cols[which.max(as.integer(str_extract(cols, "\\d+")))]
-}
-
-# Linearly interpolate each metric across games 0..max_game for one team-season
-interpolate_team <- function(d, max_game) {
-  tibble(game = 0:max_game) %>%
-    left_join(d, by = "game") %>%
-    mutate(across(
-      c(srs_current, wpct_current, d3p_current, dft_current),
-      ~ approx(game, .x, xout = game, rule = 2)$y
-    ))
-}
-
-# Predictor name (used in coef column names) → data column
-predictor_map <- c(
-  srs   = "srs_current",
-  d3p   = "d3p_current",
-  dft   = "dft_current",
-  wpct  = "wpct_current",
-  wintot = "Win.Total"
-)
-
-# One-row tibble of coefficients + R² for a fitted model.
-# Predictors absent from the model (e.g. at game 0) get a coefficient of 0.
-model_coefs <- function(m, prefix) {
-  b    <- coef(m)
-  vals <- c(
-    b[["(Intercept)"]],
-    map_dbl(predictor_map, ~ if (.x %in% names(b)) b[[.x]] else 0),
-    summary(m)$r.squared
-  )
-  names(vals) <- paste0(prefix, "_", c("icpt", paste0("b_", names(predictor_map)), "r2"))
-  as_tibble_row(vals)
-}
-
-# Fit SRS and win% models for one game checkpoint.
-# Game 0 uses Win.Total only; later games use all predictors.
-fit_game <- function(d, game) {
-  rhs <- if (game == 0) "Win.Total" else unname(predictor_map)
-  m_srs  <- lm(reformulate(rhs, "srs_final"),  data = d)
-  m_wpct <- lm(reformulate(rhs, "wpct_final"), data = d)
-  
-  bind_cols(
-    tibble(n_obs = nrow(d)),
-    model_coefs(m_srs,  "srs"),
-    model_coefs(m_wpct, "wpct")
-  )
-}
 
 # Coerce a percentage column to 0–1 (handles 0–100 input); invalid → NA
 normalize_pct <- function(x) {
@@ -100,147 +43,11 @@ srs_through_all <- function(tg, team, games) {
 }
 
 # ══════════════════════════════════════════════════════════════════════════
-# PART 1 — HISTORICAL DATA & PER-GAME MODELS
+# PART 1 — LOAD MODEL COEFFICIENTS
 # ══════════════════════════════════════════════════════════════════════════
 
-# ── Historical stats (Win.Total included) ────────────────────────────────
-df <- read_csv(hist_csv, show_col_types = FALSE)
-
-# ── Detect final-game columns ────────────────────────────────────────────
-metric_prefixes <- c(
-  srs  = "srs_after",
-  wpct = "win_pct_after",
-  d3p  = "avg_3p_pts_diff_pg_after",
-  dft  = "avg_ft_pts_diff_pg_after"
-)
-final_cols <- map_chr(metric_prefixes, find_final, d = df)
-final_game <- as.integer(str_extract(final_cols[["srs"]], "\\d+"))
-
-cat("Final columns detected:\n",
-    "  SRS:   ", final_cols[["srs"]],  "\n",
-    "  Win%:  ", final_cols[["wpct"]], "\n",
-    "  3PT:   ", final_cols[["d3p"]],  "\n",
-    "  FT:    ", final_cols[["dft"]],  "\n",
-    "  Final game:", final_game, "\n")
-
-df <- df %>% filter(!is.na(.data[[final_cols[["srs"]]]]))
-
-# ── Checkpoints present in data ──────────────────────────────────────────
-checkpoints <- c(seq(5, 80, by = 5), 3, final_game) %>% unique() %>% sort()
-checkpoint_cols <- metric_prefixes %>%
-  map(~ paste0(.x, "_", checkpoints, "_games")) %>%
-  unlist(use.names = FALSE)
-
-# ── Reshape to long ──────────────────────────────────────────────────────
-metric_rename <- c(
-  srs                = "srs_current",
-  win_pct            = "wpct_current",
-  avg_3p_pts_diff_pg = "d3p_current",
-  avg_ft_pts_diff_pg = "dft_current"
-)
-
-long <- df %>%
-  select(
-    season, team_abbr, Win.Total,
-    srs_final  = all_of(final_cols[["srs"]]),
-    wpct_final = all_of(final_cols[["wpct"]]),
-    d3p_final  = all_of(final_cols[["d3p"]]),
-    dft_final  = all_of(final_cols[["dft"]]),
-    any_of(checkpoint_cols)
-  ) %>%
-  pivot_longer(
-    cols = -c(season, team_abbr, Win.Total,
-              srs_final, wpct_final, d3p_final, dft_final),
-    names_to      = c("metric", "game"),
-    names_pattern = "^(.+)_after_(\\d+)_games$",
-    values_to     = "value"
-  ) %>%
-  mutate(
-    game   = as.integer(game),
-    metric = recode(metric, !!!metric_rename)
-  ) %>%
-  pivot_wider(names_from = metric, values_from = value) %>%
-  arrange(season, team_abbr, game)
-
-# ── Interpolate 0..final_game per team-season ────────────────────────────
-long_interp <- long %>%
-  group_by(season, team_abbr) %>%
-  group_modify(~ interpolate_team(
-    select(.x, game, srs_current, wpct_current, d3p_current, dft_current),
-    final_game
-  )) %>%
-  ungroup()
-
-constants <- long %>%
-  group_by(season, team_abbr) %>%
-  summarise(
-    Win.Total  = first(na.omit(Win.Total)),
-    srs_final  = first(na.omit(srs_final)),
-    wpct_final = first(na.omit(wpct_final)),
-    d3p_final  = first(na.omit(d3p_final)),
-    dft_final  = first(na.omit(dft_final)),
-    .groups = "drop"
-  )
-
-long_interp <- long_interp %>%
-  left_join(constants, by = c("season", "team_abbr")) %>%
-  arrange(season, team_abbr, game)
-
-incomplete <- long_interp %>%
-  count(season, team_abbr) %>%
-  filter(n != final_game + 1)
-if (nrow(incomplete) > 0) {
-  warning("Some team-seasons don't have game 0..", final_game, " rows.")
-  print(head(incomplete))
-}
-
-# ── Force game-0 in-season metrics to be uninformative ───────────────────
-team_means <- long_interp %>%
-  filter(game > 0) %>%
-  group_by(season, team_abbr) %>%
-  summarise(
-    mean_srs  = mean(srs_current,  na.rm = TRUE),
-    mean_wpct = mean(wpct_current, na.rm = TRUE),
-    mean_d3p  = mean(d3p_current,  na.rm = TRUE),
-    mean_dft  = mean(dft_current,  na.rm = TRUE),
-    .groups = "drop"
-  )
-
-long_interp <- long_interp %>%
-  left_join(team_means, by = c("season", "team_abbr")) %>%
-  mutate(
-    srs_current  = if_else(game == 0, mean_srs,  srs_current),
-    wpct_current = if_else(game == 0, mean_wpct, wpct_current),
-    d3p_current  = if_else(game == 0, mean_d3p,  d3p_current),
-    dft_current  = if_else(game == 0, mean_dft,  dft_current)
-  ) %>%
-  select(-starts_with("mean_"))
-
-# ── Fit per-game models ──────────────────────────────────────────────────
-fit_multi <- long_interp %>%
-  group_by(game) %>%
-  group_modify(~ {
-    d <- filter(.x, complete.cases(
-      srs_final, wpct_final,
-      srs_current, wpct_current, d3p_current, dft_current, Win.Total
-    ))
-    if (nrow(d) < min_obs_per_game_fit) return(tibble())
-    fit_game(d, .y$game)
-  }) %>%
-  ungroup() %>%
-  arrange(game)
-
-print(fit_multi, n = Inf, width = Inf)
-
-# ── Save coefficient tables ──────────────────────────────────────────────
-write_csv(fit_multi,   "projection_coefs_all_predictors.csv")
-write_csv(long_interp, "nba_srs_shooting_interpolated.csv")
-
-cat("\nSaved:\n",
-    "  projection_coefs_all_predictors.csv (",
-    nrow(fit_multi), " rows, games 0..", final_game, ")\n",
-    "  nba_srs_shooting_interpolated.csv (",
-    nrow(long_interp), " rows)\n", sep = "")
+fit_multi <- read_csv(coefs_csv, show_col_types = FALSE)
+cat("Loaded coefficients for", nrow(fit_multi), "game checkpoints\n")
 
 # ══════════════════════════════════════════════════════════════════════════
 # PART 2 — CURRENT-SEASON PROJECTIONS
