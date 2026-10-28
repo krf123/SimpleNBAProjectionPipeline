@@ -271,7 +271,7 @@ nba_table <- table_data %>%
     row.striping.background_color = "gray98"
   ) %>%
   tab_source_note(
-    source_note = "Data via hoopR and Covers. Model: 2027 Projection Pipeline."
+    source_note = "Data via hoopR and Covers.com. Modeling by Kevin Ferrigan."
   )
 
 gtsave(nba_table, "nba_2027_projected_standings.png")
